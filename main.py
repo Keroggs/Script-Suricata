@@ -360,6 +360,33 @@ def run_check_env() -> int:
     else:
         warn("Detección de binario omitida (no es Linux); Selenium usará el Chrome del sistema")
 
+    # Arranque real de Chrome: es lo único que distingue "está instalado" de
+    # "de verdad funciona en esta VM".
+    if binary or _shutil.which("google-chrome"):
+        print("  Probando arranque real de Chrome headless...")
+        import subprocess
+
+        exe = binary or _shutil.which("google-chrome")
+        try:
+            proc = subprocess.run(
+                [exe, "--headless=new", "--no-sandbox", "--disable-gpu",
+                 "--dump-dom", "about:blank"],
+                capture_output=True, text=True, timeout=60,
+            )
+            if proc.returncode == 0:
+                ok("Chrome headless arranca correctamente")
+            else:
+                fail(
+                    f"Chrome headless salió con código {proc.returncode}. stderr:\n          "
+                    + "\n          ".join((proc.stderr or "(vacío)").strip().splitlines()[:10])
+                )
+                print("\n  --- Causas probables ---")
+                print(SuricataBot._diagnose_chrome_launch(exe))
+        except subprocess.TimeoutExpired:
+            fail("Chrome headless se quedó colgado más de 60 s (falta de RAM, típicamente)")
+        except OSError as e:
+            fail(f"No se pudo ejecutar {exe}: {e}")
+
     if _shutil.which("chromedriver"):
         ok(f"chromedriver del sistema en {_shutil.which('chromedriver')}")
     else:

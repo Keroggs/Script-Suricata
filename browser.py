@@ -24,7 +24,11 @@ import time
 
 from dotenv import load_dotenv
 from selenium import webdriver
-from selenium.common.exceptions import NoSuchElementException, TimeoutException
+from selenium.common.exceptions import (
+    NoSuchElementException,
+    SessionNotCreatedException,
+    TimeoutException,
+)
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
@@ -326,26 +330,201 @@ class SuricataBot:
         self.user_data_dir = tempfile.mkdtemp(prefix="suricata_chrome_")
         options.add_argument(f"--user-data-dir={self.user_data_dir}")
 
-        try:
-            self.driver = webdriver.Chrome(service=Service(), options=options)
-        except Exception as err:
-            logger.warning(f"Selenium Manager no pudo iniciar ({err}), usando ChromeDriverManager de respaldo...")
-            try:
-                # Import diferido: webdriver_manager solo se necesita en este camino.
-                from webdriver_manager.chrome import ChromeDriverManager
-
-                self.driver = webdriver.Chrome(
-                    service=Service(ChromeDriverManager().install()), options=options
-                )
-            except Exception as err2:
-                logger.warning(f"ChromeDriverManager falló ({err2}), reintentando con --headless alternativo...")
-                if "--headless=new" in options.arguments:
-                    options.arguments.remove("--headless=new")
-                    options.add_argument("--headless")
-                self.driver = webdriver.Chrome(service=Service(), options=options)
+        self.driver = self._launch_driver(options, binary)
 
         self.wait = WebDriverWait(self.driver, 20)
         logger.info("Navegador iniciado")
+
+    def _launch_driver(self, options, binary: str | None):
+        """
+        Arranca chromedriver distinguiendo los dos fallos posibles.
+
+        - `SessionNotCreatedException` ("Chrome instance exited"): el driver
+          funciona, quien muere es **Chrome**. Reintentar con otro driver no
+          sirve de nada; hay que diagnosticar por qué se cae el navegador.
+        - Cualquier otro fallo: normalmente es que no hay chromedriver
+          compatible, y ahí sí tiene sentido el respaldo de ChromeDriverManager.
+        """
+        try:
+            # Arranque normal: sin logs del driver, para no gastar E/S en cada ciclo.
+            return webdriver.Chrome(service=Service(), options=options)
+
+        except SessionNotCreatedException as err:
+            logger.error("Chrome arrancó y murió inmediatamente. Diagnosticando...")
+            raise self._explain_chrome_death(err, options, binary) from err
+
+        except Exception as err:
+            logger.warning(
+                f"No se pudo iniciar chromedriver ({err}); "
+                "probando con ChromeDriverManager de respaldo..."
+            )
+            try:
+                # Import diferido: webdriver_manager solo se necesita aquí.
+                from webdriver_manager.chrome import ChromeDriverManager
+
+                return webdriver.Chrome(
+                    service=Service(ChromeDriverManager().install()), options=options
+                )
+            except SessionNotCreatedException as err2:
+                raise self._explain_chrome_death(err2, options, binary) from err2
+
+    def _explain_chrome_death(self, err, options, binary: str | None):
+        """
+        Reintenta UNA vez con el log verboso del driver activado y construye una
+        excepción que explica por qué murió Chrome.
+
+        El verbose solo se activa aquí (no en el arranque normal) porque genera
+        mucha E/S y Selenium abre el archivo en modo *append*, con lo que en un
+        servicio permanente crecería sin límite.
+        """
+        driver_log = self._driver_log_path()
+
+        # Truncar: solo interesa el intento que acaba de fallar.
+        try:
+            open(driver_log, "w", encoding="utf-8").close()
+        except OSError:
+            pass
+
+        try:
+            driver = webdriver.Chrome(
+                service=Service(log_output=driver_log, service_args=["--verbose"]),
+                options=options,
+            )
+        except Exception:
+            pass  # Se esperaba que volviera a fallar; lo que interesa es el log.
+        else:
+            # Insólito, pero arrancó en el reintento: no dejar el navegador huérfano.
+            try:
+                driver.quit()
+            except Exception:
+                pass
+
+        detail = self._diagnose_chrome_launch(binary)
+        tail = self._tail_driver_log(driver_log)
+        msg = getattr(err, "msg", str(err))
+        return SessionNotCreatedException(
+            f"{msg}\n\n=== DIAGNÓSTICO ===\n{detail}\n\n"
+            f"=== ÚLTIMAS LÍNEAS DE {driver_log} ===\n{tail}"
+        )
+
+    @staticmethod
+    def _driver_log_path():
+        """logs/chromedriver.log junto al proyecto (no depende del cwd)."""
+        log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+        try:
+            os.makedirs(log_dir, exist_ok=True)
+        except OSError:
+            return os.path.join(tempfile.gettempdir(), "suricata_chromedriver.log")
+        return os.path.join(log_dir, "chromedriver.log")
+
+    @staticmethod
+    def _tail_driver_log(path: str, lines: int = 25) -> str:
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                content = fh.read().splitlines()
+        except OSError:
+            return "(no se pudo leer el log del driver)"
+        # Las líneas relevantes son las que menciona Chrome al morir.
+        relevant = [ln for ln in content if "ERROR" in ln or "error" in ln or "Failed" in ln]
+        chosen = relevant[-lines:] if relevant else content[-lines:]
+        return "\n".join(chosen) or "(log vacío)"
+
+    @classmethod
+    def _diagnose_chrome_launch(cls, binary: str | None) -> str:
+        """
+        Ejecuta Chrome directamente para capturar el motivo real de la caída y
+        comprueba las causas típicas en una VM de Ubuntu.
+        """
+        import subprocess
+
+        notes: list[str] = []
+
+        # 1) Ejecutar el navegador a mano: su stderr suele decir exactamente qué falta.
+        exe = binary or shutil.which("google-chrome") or shutil.which("chromium")
+        if not exe:
+            notes.append("· No se encontró ningún ejecutable de Chrome en el sistema.")
+        else:
+            cmd = [exe, "--headless=new", "--no-sandbox", "--disable-gpu",
+                   "--dump-dom", "about:blank"]
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
+                err_out = (proc.stderr or "").strip()
+                if proc.returncode != 0:
+                    notes.append(
+                        f"· `{exe} --headless=new` salió con código {proc.returncode}.\n"
+                        f"  stderr:\n    " + "\n    ".join(err_out.splitlines()[:15] or ["(vacío)"])
+                    )
+                    if "error while loading shared libraries" in err_out:
+                        lib = err_out.split("shared libraries:")[-1].split(":")[0].strip()
+                        notes.append(
+                            f"  → Falta una biblioteca del sistema ({lib}). Instala las dependencias:\n"
+                            "      sudo apt-get install -y -f\n"
+                            "      sudo apt-get install -y libnss3 libatk1.0-0 libatk-bridge2.0-0 \\\n"
+                            "          libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 \\\n"
+                            "          libxfixes3 libxrandr2 libgbm1 libasound2t64 libpango-1.0-0"
+                        )
+                else:
+                    notes.append(
+                        f"· `{exe} --headless=new` funciona por sí solo "
+                        "(el problema está en las opciones o en el entorno del servicio, no en Chrome)."
+                    )
+            except subprocess.TimeoutExpired:
+                notes.append(f"· `{exe} --headless=new` se quedó colgado más de 45 s.")
+            except OSError as e:
+                notes.append(f"· No se pudo ejecutar {exe}: {e}")
+
+        # 2) Memoria disponible: la causa más habitual de que Chrome muera al instante.
+        try:
+            meminfo = open("/proc/meminfo", encoding="utf-8").read()
+            total_mb = int(re.search(r"MemTotal:\s+(\d+)", meminfo).group(1)) // 1024
+            avail_mb = int(re.search(r"MemAvailable:\s+(\d+)", meminfo).group(1)) // 1024
+            notes.append(f"· RAM: {avail_mb} MB disponibles de {total_mb} MB totales.")
+            if avail_mb < 400:
+                notes.append(
+                    "  → INSUFICIENTE. Chrome headless necesita ~400-500 MB y el kernel lo mata "
+                    "al arrancar. Amplía la RAM de la VM a 2 GB o añade swap."
+                )
+        except (OSError, AttributeError):
+            pass
+
+        # 3) Ubuntu 23.10+ restringe los user namespaces sin privilegios vía AppArmor,
+        #    lo que impide arrancar el sandbox de Chrome.
+        try:
+            userns = open(
+                "/proc/sys/kernel/apparmor_restrict_unprivileged_userns", encoding="utf-8"
+            ).read().strip()
+            if userns == "1":
+                notes.append(
+                    "· AppArmor restringe los user namespaces sin privilegios "
+                    "(kernel.apparmor_restrict_unprivileged_userns=1, por defecto en Ubuntu 23.10+).\n"
+                    "  → El script ya pasa --no-sandbox, pero si persiste, desactívalo:\n"
+                    "      echo 'kernel.apparmor_restrict_unprivileged_userns=0' | "
+                    "sudo tee /etc/sysctl.d/60-apparmor-namespace.conf\n"
+                    "      sudo sysctl --system"
+                )
+        except OSError:
+            pass
+
+        # 4) /dev/shm minúsculo (típico en contenedores; el script ya lo evita).
+        try:
+            st = os.statvfs("/dev/shm")
+            shm_mb = (st.f_blocks * st.f_frsize) // (1024 * 1024)
+            if shm_mb < 64:
+                notes.append(
+                    f"· /dev/shm es de solo {shm_mb} MB. El script ya pasa "
+                    "--disable-dev-shm-usage, pero conviene ampliarlo."
+                )
+        except (OSError, AttributeError):
+            pass
+
+        # 5) Usuario y HOME: sin HOME escribible Chrome no puede crear su perfil.
+        home = os.getenv("HOME")
+        if not home:
+            notes.append("· HOME no está definido. Añade `Environment=HOME=/home/USUARIO` a la unit de systemd.")
+        elif not os.access(home, os.W_OK):
+            notes.append(f"· HOME={home} no es escribible por el usuario actual.")
+
+        return "\n".join(notes) if notes else "(sin causas evidentes)"
 
     @staticmethod
     def _find_chrome_binary() -> str | None:
