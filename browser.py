@@ -2,65 +2,414 @@
 browser.py
 Controla el navegador Chrome con Selenium para gestionar departamentos
 de agentes en datavoip.suricata.cloud/agentes2.
+
+Estrategia de rendimiento: la tabla de agentes se recorre en una sola pasada
+(no una recarga por agente) y toda la manipulación del modal se hace en una
+única llamada JS, para minimizar los round-trips al chromedriver, que son el
+coste dominante del script.
+
+Nota sobre el portal: la tabla se reordena entre peticiones, de modo que una
+fila puede cambiar de página de una carga a otra. Por eso el modal se abre
+buscando y pulsando por NOMBRE dentro de una misma ejecución de JS (atómico), y
+si al terminar una pasada quedan agentes sin localizar se repite el recorrido.
 """
 
-import json
+import difflib
 import logging
 import os
 import re
+import shutil
+import tempfile
 import time
 
 from dotenv import load_dotenv
 from selenium import webdriver
-from selenium.common.exceptions import (
-    ElementClickInterceptedException,
-    NoSuchElementException,
-    TimeoutException,
-)
+from selenium.common.exceptions import NoSuchElementException, TimeoutException
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
-from webdriver_manager.chrome import ChromeDriverManager
 
 from config import AGENTS_URL, BASE_URL, TARGET_AGENTS
 
 load_dotenv()
 logger = logging.getLogger(__name__)
 
+AGENT_BUTTON_SELECTOR = "button[title='Editar Departamentos']"
+MODAL_VISIBLE_SELECTOR = ".modal.show, .modal[style*='display: block']"
+
+# ---------------------------------------------------------------------------
+# Scripts JS. Se definen a nivel de módulo para no reconstruir la cadena en
+# cada llamada y para mantener legible el código Python.
+# ---------------------------------------------------------------------------
+
+# Extrae los nombres de todos los agentes de la página actual en una sola
+# llamada, parseando el onclick en el navegador en vez de hacer un
+# get_attribute() por botón desde Python.
+JS_SCRAPE_AGENTS = r"""
+var out = [];
+var btns = document.querySelectorAll("button[title='Editar Departamentos']");
+for (var i = 0; i < btns.length; i++) {
+    var oc = btns[i].getAttribute('onclick') || '';
+    var m = oc.match(/abrirEditarDeptos\((\{[\s\S]+\})\)/);
+    var name = '';
+    if (m) {
+        try {
+            var d = JSON.parse(m[1]);
+            name = ((d.nombre || '') + ' ' + (d.last_name || '')).trim();
+        } catch (e) { name = ''; }
+    }
+    out.push(name);
+}
+return out;
+"""
+
+# Lee, modifica y reporta todos los checkboxes del modal en una sola llamada.
+# Devuelve {initial, changes, unchanged, unlabeled} para el log.
+JS_APPLY_DEPARTMENTS = r"""
+var targets = arguments[0];
+var modal = document.querySelector('.modal.show') ||
+            document.querySelector('.modal[style*="display: block"]') ||
+            document.querySelector('.modal[style*="display:block"]');
+if (!modal) return null;
+
+var norm = function (s) { return (s || '').toLowerCase().trim(); };
+var wanted = {};
+for (var t = 0; t < targets.length; t++) { wanted[norm(targets[t])] = true; }
+
+var boxes = modal.querySelectorAll('input[type="checkbox"]');
+var initial = [], changes = [], unchanged = [], unlabeled = 0;
+
+for (var i = 0; i < boxes.length; i++) {
+    var cb = boxes[i];
+    var label = '';
+
+    if (cb.id) {
+        var lbl = modal.querySelector('label[for="' + cb.id + '"]');
+        if (lbl) label = lbl.textContent.trim();
+    }
+    if (!label) {
+        var sib = cb.nextElementSibling;
+        while (sib) {
+            if (sib.tagName === 'LABEL') { label = sib.textContent.trim(); break; }
+            sib = sib.nextElementSibling;
+        }
+    }
+    if (!label && cb.parentElement) { label = cb.parentElement.textContent.trim(); }
+
+    if (!label) { unlabeled++; continue; }
+
+    initial.push({ label: label, checked: cb.checked });
+
+    var should = !!wanted[norm(label)];
+    if (should === cb.checked) { unchanged.push(label); continue; }
+
+    // Click nativo para que se disparen los listeners de la página.
+    cb.scrollIntoView({ block: 'center' });
+    try { cb.click(); } catch (e) { }
+
+    // Si el estado no cambió, intentar a través de la etiqueta asociada.
+    if (cb.checked !== should) {
+        var lb = (cb.labels && cb.labels[0]) ? cb.labels[0] : null;
+        if (!lb && cb.id) lb = document.querySelector('label[for="' + cb.id + '"]');
+        if (!lb) lb = cb.nextElementSibling;
+        if (lb) { try { lb.click(); } catch (e) { } }
+    }
+
+    // Último recurso: fijar la propiedad y notificar el cambio.
+    if (cb.checked !== should) {
+        cb.checked = should;
+        cb.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+
+    changes.push({ label: label, checked: should, ok: cb.checked === should });
+}
+
+return { initial: initial, changes: changes, unchanged: unchanged, unlabeled: unlabeled };
+"""
+
+# Localiza y pulsa el botón Guardar del modal.
+JS_CLICK_SAVE = r"""
+var modal = document.querySelector('.modal.show') ||
+            document.querySelector('.modal[style*="display: block"]') ||
+            document.querySelector('.modal[style*="display:block"]');
+if (!modal) return false;
+var buttons = modal.querySelectorAll('button');
+var target = null;
+for (var i = 0; i < buttons.length; i++) {
+    if (buttons[i].textContent.trim().toLowerCase().indexOf('guardar') !== -1) {
+        target = buttons[i];
+        break;
+    }
+}
+if (!target) target = modal.querySelector('button.btn-primary');
+if (!target) return false;
+target.scrollIntoView({ block: 'center' });
+target.click();
+return true;
+"""
+
+# Avanza a la siguiente página de la tabla. Devuelve false si no hay más.
+JS_NEXT_PAGE = r"""
+var modal = document.querySelector('.modal.show, .modal[style*="display: block"]');
+if (modal) return false;
+
+var candidate = null;
+var navs = document.querySelectorAll('.pagination, .dataTables_paginate, nav[aria-label*="pagination"], nav[aria-label*="Paginación"]');
+var scope = navs.length > 0 ? Array.prototype.slice.call(navs) : [document.body];
+
+for (var c = 0; c < scope.length && !candidate; c++) {
+    var links = scope[c].querySelectorAll('a, button, li');
+    for (var i = 0; i < links.length; i++) {
+        var el = links[i];
+        if (el.tagName === 'LI') {
+            var child = el.querySelector('a, button');
+            if (child) el = child;
+        }
+        var li = el.closest('li');
+        if (li && (li.classList.contains('disabled') || li.getAttribute('aria-disabled') === 'true')) continue;
+        if (el.classList.contains('disabled') || el.hasAttribute('disabled') || el.getAttribute('aria-disabled') === 'true') continue;
+
+        var text  = (el.textContent || '').trim().toLowerCase();
+        var label = (el.getAttribute('aria-label') || '').toLowerCase();
+        var rel   = (el.getAttribute('rel') || '').toLowerCase();
+        var id    = (el.id || '').toLowerCase();
+        var cls   = (el.className || '').toLowerCase();
+
+        if (text.indexOf('anterior') !== -1 || text.indexOf('previous') !== -1 ||
+            label.indexOf('anterior') !== -1 || label.indexOf('previous') !== -1 ||
+            text === '‹' || text === '«' || text === '<') continue;
+
+        if (text === 'siguiente' || text.indexOf('siguiente') !== -1 ||
+            text === 'next' || text.indexOf('next') !== -1 ||
+            text === '›' || text === '»' || text === '>' ||
+            label.indexOf('siguiente') !== -1 || label.indexOf('next') !== -1 ||
+            rel === 'next' || id.indexOf('next') !== -1 || cls.indexOf('next') !== -1) {
+            candidate = el;
+            break;
+        }
+    }
+}
+
+if (!candidate) {
+    var active = document.querySelector('.pagination .active, .dataTables_paginate .current');
+    if (active) {
+        var nxt = active.nextElementSibling;
+        if (nxt && !nxt.classList.contains('disabled')) {
+            candidate = nxt.querySelector('a, button') ||
+                        ((nxt.tagName === 'A' || nxt.tagName === 'BUTTON') ? nxt : null);
+        }
+    }
+}
+
+if (!candidate) return false;
+candidate.scrollIntoView({ block: 'center' });
+candidate.click();
+return true;
+"""
+
+# Abre el modal del agente cuyo nombre coincide EXACTAMENTE con el recibido.
+#
+# La búsqueda y el click ocurren dentro de la misma ejecución de JS, de forma
+# atómica. Es imprescindible porque la tabla se reordena sola entre peticiones:
+# resolver el elemento en una llamada y pulsarlo en otra provoca
+# StaleElementReference y, peor aún, puede acabar pulsando la fila equivocada si
+# el orden cambió en medio.
+JS_OPEN_AGENT_MODAL = r"""
+var wanted = arguments[0];
+var btns = document.querySelectorAll("button[title='Editar Departamentos']");
+for (var i = 0; i < btns.length; i++) {
+    var oc = btns[i].getAttribute('onclick') || '';
+    var m = oc.match(/abrirEditarDeptos\((\{[\s\S]+\})\)/);
+    if (!m) continue;
+    var name = '';
+    try {
+        var d = JSON.parse(m[1]);
+        name = ((d.nombre || '') + ' ' + (d.last_name || '')).trim();
+    } catch (e) { continue; }
+
+    if (name === wanted) {
+        btns[i].scrollIntoView({ block: 'center' });
+        btns[i].click();
+        return true;
+    }
+}
+return false;
+"""
+
+JS_CLOSE_MODAL = r"""
+var modal = document.querySelector('.modal.show, .modal[style*="display: block"]');
+if (!modal) return false;
+var btn = modal.querySelector('.btn-close, [data-dismiss="modal"], [data-bs-dismiss="modal"], .close');
+if (!btn) {
+    var buttons = modal.querySelectorAll('button');
+    for (var i = 0; i < buttons.length; i++) {
+        if (buttons[i].textContent.trim().toLowerCase().indexOf('cancelar') !== -1) { btn = buttons[i]; break; }
+    }
+}
+if (btn) { btn.click(); return true; }
+return false;
+"""
+
 
 class SuricataBot:
     """Bot de automatización para la gestión de departamentos de agentes."""
+
+    MAX_PAGES = 50   # cota de seguridad ante una paginación que no termine
+    MAX_PASSES = 3   # reintentos de recorrido completo (la tabla se reordena sola)
 
     def __init__(self, headless: bool = True):
         self.headless = headless
         self.driver = None
         self.wait = None
+        self.user_data_dir = None
 
     # ------------------------------------------------------------------
     # Ciclo de vida del navegador
     # ------------------------------------------------------------------
 
     def start(self):
-        """Inicializa el driver de Chrome."""
+        """Inicializa el driver de Chrome con una configuración de bajo consumo."""
         options = Options()
         if self.headless:
             options.add_argument("--headless=new")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--disable-gpu")
-        options.add_argument("--window-size=1920,1080")
-        options.add_argument("--lang=es-ES")
-        options.add_argument("--disable-notifications")
 
-        service = Service(ChromeDriverManager().install())
-        self.driver = webdriver.Chrome(service=service, options=options)
+        # No esperar a subrecursos (imágenes, analytics) para dar la página por cargada.
+        options.page_load_strategy = "eager"
+
+        for arg in (
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--disable-software-rasterizer",
+            "--disable-setuid-sandbox",
+            "--disable-extensions",
+            "--window-size=1920,1080",
+            "--lang=es-ES",
+            "--disable-notifications",
+            "--disable-blink-features=AutomationControlled",
+            # Recorte de consumo: sin imágenes, sin tareas de fondo, sin caché en disco.
+            "--blink-settings=imagesEnabled=false",
+            "--disable-background-networking",
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding",
+            "--disable-client-side-phishing-detection",
+            "--disable-component-update",
+            "--disable-default-apps",
+            "--disable-sync",
+            "--mute-audio",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-features=Translate,MediaRouter,OptimizationHints",
+            "--disable-gpu-shader-disk-cache",
+            "--disk-cache-size=1048576",
+            "--media-cache-size=1048576",
+            "--disable-application-cache",
+            "--disable-crash-reporter",
+            "--disable-breakpad",
+            "--remote-debugging-port=0",
+            "--log-level=3",
+        ):
+            options.add_argument(arg)
+
+        binary = self._find_chrome_binary()
+        if binary:
+            options.binary_location = binary
+            logger.info(f"Usando binario de Chrome del sistema: {binary}")
+
+        self._cleanup_stale_profiles()
+
+        # Directorio de datos de usuario aislado para evitar conflictos de
+        # sockets/puertos en Linux.
+        self.user_data_dir = tempfile.mkdtemp(prefix="suricata_chrome_")
+        options.add_argument(f"--user-data-dir={self.user_data_dir}")
+
+        try:
+            self.driver = webdriver.Chrome(service=Service(), options=options)
+        except Exception as err:
+            logger.warning(f"Selenium Manager no pudo iniciar ({err}), usando ChromeDriverManager de respaldo...")
+            try:
+                # Import diferido: webdriver_manager solo se necesita en este camino.
+                from webdriver_manager.chrome import ChromeDriverManager
+
+                self.driver = webdriver.Chrome(
+                    service=Service(ChromeDriverManager().install()), options=options
+                )
+            except Exception as err2:
+                logger.warning(f"ChromeDriverManager falló ({err2}), reintentando con --headless alternativo...")
+                if "--headless=new" in options.arguments:
+                    options.arguments.remove("--headless=new")
+                    options.add_argument("--headless")
+                self.driver = webdriver.Chrome(service=Service(), options=options)
+
         self.wait = WebDriverWait(self.driver, 20)
         logger.info("Navegador iniciado")
 
+    @staticmethod
+    def _find_chrome_binary() -> str | None:
+        """
+        Localiza el ejecutable de Chrome/Chromium del sistema (Linux).
+
+        Evita deliberadamente las versiones empaquetadas como **snap**: en Ubuntu
+        22.04+ `apt install chromium-browser` instala un shim de snap cuyo
+        confinamiento le impide leer el perfil que creamos en /tmp, y Selenium
+        falla con un críptico "unable to discover open pages". Se prefiere
+        siempre el .deb de Google Chrome.
+        """
+        for path in (
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+            "/opt/google/chrome/chrome",
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+        ):
+            if not os.path.exists(path):
+                continue
+
+            # Un shim de snap es un enlace/script que apunta a /snap/...
+            real = os.path.realpath(path)
+            if real.startswith("/snap/") or "/snapd/" in real:
+                logger.warning(
+                    f"Ignorando '{path}': es un paquete snap ({real}), incompatible con Selenium. "
+                    "Instala Google Chrome desde el .deb oficial."
+                )
+                continue
+
+            return path
+
+        return None
+
+    @staticmethod
+    def _cleanup_stale_profiles(max_age_seconds: int = 3600):
+        """
+        Borra perfiles temporales de ejecuciones previas que quedaron huérfanos.
+
+        Solo se borran los que llevan un rato sin tocarse: si el servicio se
+        reinicia mientras la instancia anterior todavía agoniza, borrarle el
+        perfil en uso la haría fallar.
+        """
+        temp_base = tempfile.gettempdir()
+        cutoff = time.time() - max_age_seconds
+        try:
+            entries = os.listdir(temp_base)
+        except OSError:
+            return
+
+        for item in entries:
+            if not item.startswith("suricata_chrome_"):
+                continue
+            path = os.path.join(temp_base, item)
+            try:
+                if os.path.getmtime(path) > cutoff:
+                    continue
+            except OSError:
+                continue
+            shutil.rmtree(path, ignore_errors=True)
+
     def stop(self):
-        """Cierra el navegador."""
+        """Cierra el navegador y limpia el directorio temporal."""
         if self.driver:
             try:
                 self.driver.quit()
@@ -69,15 +418,19 @@ class SuricataBot:
             self.driver = None
             logger.info("Navegador cerrado")
 
+        if self.user_data_dir:
+            shutil.rmtree(self.user_data_dir, ignore_errors=True)
+            self.user_data_dir = None
+
     # ------------------------------------------------------------------
     # Login
     # ------------------------------------------------------------------
 
     def login(self):
         """Inicia sesión en el portal con las credenciales del .env."""
-        url  = os.getenv("SURICATA_URL", BASE_URL)
+        url = os.getenv("SURICATA_URL", BASE_URL)
         user = os.getenv("SURICATA_USER")
-        pwd  = os.getenv("SURICATA_PASSWORD")
+        pwd = os.getenv("SURICATA_PASSWORD")
 
         if not user or not pwd:
             raise ValueError("Credenciales no encontradas en el archivo .env")
@@ -88,9 +441,7 @@ class SuricataBot:
         # Campo email — el form usa type="text" con name="email"
         try:
             user_field = self.wait.until(
-                EC.presence_of_element_located(
-                    (By.CSS_SELECTOR, "input[name='email']")
-                )
+                EC.presence_of_element_located((By.CSS_SELECTOR, "input[name='email']"))
             )
         except TimeoutException:
             raise TimeoutException("No se encontró el campo de email en la página de login")
@@ -98,22 +449,23 @@ class SuricataBot:
         user_field.clear()
         user_field.send_keys(user)
 
-        # Campo contraseña
         pass_field = self.driver.find_element(By.CSS_SELECTOR, "input[name='password']")
         pass_field.clear()
         pass_field.send_keys(pwd)
 
         # Botón "Iniciar sesión" — no tiene type="submit", usa clase btn-primary-custom
-        submit = self.driver.find_element(
+        self.driver.find_element(
             By.CSS_SELECTOR,
-            "button.btn-primary-custom, button[type='submit'], input[type='submit']"
-        )
-        submit.click()
+            "button.btn-primary-custom, button[type='submit'], input[type='submit']",
+        ).click()
 
-        # Esperar a que la navegación termine
-        time.sleep(3)
+        # Esperar a que el formulario desaparezca en vez de dormir un tiempo fijo.
+        try:
+            self.wait.until(EC.staleness_of(pass_field))
+        except TimeoutException:
+            logger.warning("El formulario de login no cambió tras el envío; continuando de todas formas")
+
         logger.info(f"Login completado. URL actual: {self.driver.current_url}")
-
 
     # ------------------------------------------------------------------
     # Navegación
@@ -123,55 +475,83 @@ class SuricataBot:
         """Navega a la página de agentes y espera a que carguen los botones."""
         logger.info(f"Navegando a: {AGENTS_URL}")
         self.driver.get(AGENTS_URL)
-
-        try:
-            self.wait.until(
-                EC.presence_of_element_located(
-                    (By.CSS_SELECTOR, "button[title='Editar Departamentos']")
-                )
-            )
-        except TimeoutException:
-            raise TimeoutException(
-                "No se encontraron botones 'Editar Departamentos'. "
-                "Verifica que el login fue exitoso."
-            )
-
+        self._wait_for_agent_buttons(
+            "No se encontraron botones 'Editar Departamentos'. "
+            "Verifica que el login fue exitoso."
+        )
         logger.info("Página de agentes cargada correctamente")
 
-    # ------------------------------------------------------------------
-    # Extracción de agentes
-    # ------------------------------------------------------------------
+    def _wait_for_agent_buttons(self, error_msg: str | None = None):
+        try:
+            self.wait.until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, AGENT_BUTTON_SELECTOR))
+            )
+        except TimeoutException:
+            if error_msg:
+                raise TimeoutException(error_msg)
 
-    def _get_agent_buttons(self) -> list[tuple[str, object]]:
-        """
-        Retorna lista de (nombre_completo, elemento_boton) para todos
-        los agentes encontrados en la página.
-        """
-        buttons = self.driver.find_elements(
-            By.CSS_SELECTOR, "button[title='Editar Departamentos']"
-        )
-        result = []
-        for btn in buttons:
-            onclick = btn.get_attribute("onclick") or ""
-            # Extraer el JSON del onclick="abrirEditarDeptos({...})"
-            match = re.search(r"abrirEditarDeptos\((\{.+\})\)", onclick, re.DOTALL)
-            if not match:
-                continue
-            try:
-                data = json.loads(match.group(1))
-                nombre    = (data.get("nombre", "") or "").strip()
-                apellido  = (data.get("last_name", "") or "").strip()
-                full_name = f"{nombre} {apellido}".strip()
-                result.append((full_name, btn))
-            except json.JSONDecodeError as e:
-                logger.warning(f"No se pudo parsear JSON del botón: {e}")
-
-        logger.debug(f"Agentes encontrados en página: {[n for n, _ in result]}")
-        return result
+    # ------------------------------------------------------------------
+    # Coincidencia de nombres
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _normalize(name: str) -> str:
         return name.lower().strip()
+
+    @staticmethod
+    def _clean_tokens(s: str) -> list[str]:
+        """Tokeniza un nombre ignorando paréntesis, signos y tokens de una letra."""
+        s_no_paren = re.sub(r"\([^\)]*\)", " ", s)
+        cleaned = re.sub(r"[^a-zA-Z0-9áéíóúÁÉÍÓÚñÑ\s]", " ", s_no_paren)
+        return [t for t in cleaned.lower().split() if len(t) > 1]
+
+    @classmethod
+    def _match_agent_name(cls, page_name: str, target_name: str) -> bool:
+        """Compara nombres tolerando orden de nombre/apellido, mayúsculas y variantes ortográficas."""
+        if cls._normalize(page_name) == cls._normalize(target_name):
+            return True
+
+        p_tokens = cls._clean_tokens(page_name)
+        t_tokens = cls._clean_tokens(target_name)
+        if not p_tokens or not t_tokens:
+            return False
+
+        p_set, t_set = set(p_tokens), set(t_tokens)
+        if p_set == t_set or t_set.issubset(p_set) or p_set.issubset(t_set):
+            return True
+
+        # Comparación token por token tolerando pequeñas diferencias tipográficas
+        # (ej: ruby/rubi, yenireth/yeniret).
+        shorter, longer = (
+            (t_tokens, p_tokens) if len(t_tokens) <= len(p_tokens) else (p_tokens, t_tokens)
+        )
+        return all(
+            any(difflib.SequenceMatcher(None, s_tok, l_tok).ratio() >= 0.75 for l_tok in longer)
+            for s_tok in shorter
+        )
+
+    # ------------------------------------------------------------------
+    # Recorrido de la tabla
+    # ------------------------------------------------------------------
+
+    def _scrape_page_agents(self) -> list[str]:
+        """Nombres de los agentes de la página actual, en una sola llamada JS."""
+        names = self.driver.execute_script(JS_SCRAPE_AGENTS) or []
+        logger.debug(f"Agentes en la página actual: {names}")
+        return names
+
+    def _go_to_next_page(self) -> bool:
+        """Avanza a la siguiente página de la tabla. False si no hay más páginas."""
+        try:
+            if not self.driver.execute_script(JS_NEXT_PAGE):
+                return False
+        except Exception as e:
+            logger.debug(f"Error al intentar avanzar de página: {e}")
+            return False
+
+        logger.debug("  → Avanzando a la siguiente página de la tabla...")
+        self._wait_for_agent_buttons()
+        return True
 
     # ------------------------------------------------------------------
     # Procesamiento de agentes
@@ -185,55 +565,128 @@ class SuricataBot:
         """
         Aplica la configuración de departamentos a los agentes objetivo.
 
+        La tabla del portal se reordena entre peticiones (las filas cambian de
+        página de una carga a otra), así que se recorre en pasadas completas: en
+        cada página se procesan todos los pendientes que aparezcan y se avanza;
+        si al terminar la pasada quedan agentes sin encontrar, se repite desde la
+        página 1, hasta MAX_PASSES veces.
+
         Args:
-            target_departments: Lista de departamentos a marcar.
-                                Pasar lista vacía [] para desmarcar todos.
-            agents_override:    Lista de nombres de agentes a procesar.
-                                Si es None, usa TARGET_AGENTS de config.py.
+            target_departments: Departamentos a marcar. Lista vacía [] desmarca todos.
+            agents_override:    Agentes a procesar. Si es None, usa TARGET_AGENTS.
 
         Returns:
-            Resumen con contadores de éxito y error.
+            Resumen con contadores de éxito, no encontrados y error.
         """
-        agents_to_process = agents_override if agents_override is not None else TARGET_AGENTS
-        page_agents = self._get_agent_buttons()
+        pending = list(agents_override if agents_override is not None else TARGET_AGENTS)
         summary = {"ok": 0, "not_found": 0, "error": 0}
 
-        for target_name in agents_to_process:
-            # Buscar agente en la página
-            match_btn = None
-            for full_name, btn in page_agents:
-                if self._normalize(full_name) == self._normalize(target_name):
-                    match_btn = btn
-                    break
+        logger.info(f"Agentes a procesar ({len(pending)}): {', '.join(pending)}")
 
-            if match_btn is None:
-                logger.warning(f"⚠  Agente no encontrado en página: '{target_name}'")
-                summary["not_found"] += 1
-                continue
+        for pass_num in range(1, self.MAX_PASSES + 1):
+            if not pending:
+                break
 
-            try:
-                self._process_agent(target_name, match_btn, target_departments)
-                summary["ok"] += 1
-            except Exception as e:
-                logger.error(f"✗  Error procesando '{target_name}': {e}", exc_info=True)
-                summary["error"] += 1
-                # Intentar cerrar el modal si quedó abierto
-                self._safe_close_modal()
+            if pass_num > 1:
+                logger.info(
+                    f"Pasada {pass_num}/{self.MAX_PASSES} — "
+                    f"{len(pending)} agente(s) sin localizar: {', '.join(pending)} "
+                    "(la tabla se reordenó entre páginas)"
+                )
+
+            self.go_to_agents_page()
+            processed = self._sweep_pages(pending, target_departments, summary)
+
+            if not processed:
+                # Una pasada completa sin procesar a nadie: insistir no ayudaría.
+                break
+
+        for target_name in pending:
+            logger.warning(f"⚠  Agente no encontrado en ninguna página de la tabla: '{target_name}'")
+            summary["not_found"] += 1
 
         return summary
 
-    def _process_agent(self, agent_name: str, btn, target_departments: list[str]):
-        """Abre el modal de edición y aplica los checkboxes correctos."""
-        target_normalized = {self._normalize(d) for d in target_departments}
+    def _sweep_pages(
+        self, pending: list[str], target_departments: list[str], summary: dict
+    ) -> int:
+        """
+        Recorre la paginación de principio a fin procesando los pendientes.
 
+        Muta `pending` (quita los resueltos) y `summary`. Devuelve cuántos
+        agentes se procesaron en esta pasada.
+        """
+        processed = 0
+        page_num = 1
+
+        while pending and page_num <= self.MAX_PAGES:
+            for target_name, page_name in self._match_page(pending):
+                try:
+                    if not self._open_agent_modal(page_name):
+                        # La fila cambió de página entre el scrape y el click.
+                        logger.warning(
+                            f"  '{target_name}' ya no está en la página {page_num}; "
+                            "se buscará más adelante"
+                        )
+                        continue
+
+                    logger.info(f"  ✓ '{target_name}' encontrado en la página {page_num}")
+                    self._process_agent(target_name, target_departments)
+                    summary["ok"] += 1
+                except Exception as e:
+                    logger.error(f"✗  Error procesando '{target_name}': {e}", exc_info=True)
+                    summary["error"] += 1
+                    self._safe_close_modal()
+
+                processed += 1
+                pending.remove(target_name)
+
+            if not pending:
+                break
+
+            if self._go_to_next_page():
+                page_num += 1
+                logger.info(
+                    f"  Buscando {len(pending)} agente(s) restante(s) en la página {page_num}..."
+                )
+            else:
+                break
+
+        return processed
+
+    def _match_page(self, pending: list[str]) -> list[tuple[str, str]]:
+        """
+        Pares (nombre_objetivo, nombre_en_la_tabla) presentes en la página actual.
+
+        Se devuelve también el nombre exacto tal como aparece en la tabla porque
+        es la clave con la que luego se abre el modal de forma atómica.
+        """
+        found: list[tuple[str, str]] = []
+        matched = set()
+        for page_name in self._scrape_page_agents():
+            if not page_name:
+                continue
+            for target_name in pending:
+                if target_name not in matched and self._match_agent_name(page_name, target_name):
+                    found.append((target_name, page_name))
+                    matched.add(target_name)
+                    break
+        return found
+
+    def _open_agent_modal(self, page_name: str) -> bool:
+        """
+        Abre el modal del agente localizándolo y pulsándolo en una sola llamada JS.
+
+        Hacerlo atómicamente evita StaleElementReference y, sobre todo, evita
+        pulsar la fila equivocada si la tabla se reordena en medio.
+        """
+        return bool(self.driver.execute_script(JS_OPEN_AGENT_MODAL, page_name))
+
+    def _process_agent(self, agent_name: str, target_departments: list[str]):
+        """Aplica los checkboxes correctos en el modal ya abierto."""
         logger.info(f"  → Procesando: {agent_name}")
 
-        # Scroll al botón y abrir modal
-        self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
-        time.sleep(0.4)
-        self.driver.execute_script("arguments[0].click();", btn)
-
-        # Esperar a que el modal esté completamente visible y con checkboxes
+        # Esperar a que el modal esté visible y con checkboxes.
         try:
             self.wait.until(
                 EC.presence_of_element_located(
@@ -241,251 +694,69 @@ class SuricataBot:
                 )
             )
         except TimeoutException:
-            # Fallback si el modal no tiene clase .show pero igual está visible
+            # Fallback si el modal no lleva la clase .show pero igual está visible.
             self.wait.until(
                 EC.presence_of_element_located(
                     (By.CSS_SELECTOR, ".modal input[type='checkbox']")
                 )
             )
-        time.sleep(0.5)
 
-        # ── Leer todos los checkboxes y sus etiquetas vía JavaScript ──────────
-        # Más confiable que Selenium para estructuras Bootstrap dinámicas
-        cb_data = self.driver.execute_script("""
-            var results = [];
-            // Buscar dentro del modal visible
-            var modal = document.querySelector('.modal.show') ||
-                        document.querySelector('.modal[style*="display: block"]') ||
-                        document.querySelector('.modal[style*="display:block"]');
-            if (!modal) return results;
+        # Leer estado, decidir y aplicar todos los cambios en una sola llamada.
+        result = self.driver.execute_script(JS_APPLY_DEPARTMENTS, list(target_departments))
 
-            var checkboxes = modal.querySelectorAll('input[type="checkbox"]');
-            checkboxes.forEach(function(cb, idx) {
-                var label = '';
-
-                // 1) label[for=id]
-                if (cb.id) {
-                    var lbl = modal.querySelector('label[for="' + cb.id + '"]');
-                    if (lbl) label = lbl.textContent.trim();
-                }
-
-                // 2) label hermano siguiente
-                if (!label) {
-                    var sib = cb.nextElementSibling;
-                    while (sib) {
-                        if (sib.tagName === 'LABEL') { label = sib.textContent.trim(); break; }
-                        sib = sib.nextElementSibling;
-                    }
-                }
-
-                // 3) texto del contenedor padre (form-check)
-                if (!label && cb.parentElement) {
-                    label = cb.parentElement.textContent.trim();
-                }
-
-                results.push({ index: idx, label: label, checked: cb.checked });
-            });
-            return results;
-        """)
-
-        if not cb_data:
+        if not result or not result.get("initial"):
             raise NoSuchElementException(
-                f"No se encontraron checkboxes en el modal de '{agent_name}'"
+                f"No se encontraron checkboxes con etiqueta en el modal de '{agent_name}'"
             )
 
-        logger.debug(f"    Checkboxes encontrados: {[(d['label'], d['checked']) for d in cb_data]}")
-
-        # Obtener los elementos DOM exactos de los checkboxes vía JS para que coincidan con idx
-        checkboxes_els = self.driver.execute_script("""
-            var modal = document.querySelector('.modal.show') ||
-                        document.querySelector('.modal[style*="display: block"]') ||
-                        document.querySelector('.modal[style*="display:block"]') ||
-                        document.querySelector('.modal');
-            return modal ? Array.from(modal.querySelectorAll('input[type="checkbox"]')) : [];
-        """)
-
-        # Log del HTML del modal para diagnóstico si fuera necesario
-        modal_html = self.driver.execute_script("""
-            var modal = document.querySelector('.modal.show') ||
-                        document.querySelector('.modal[style*="display: block"]') ||
-                        document.querySelector('.modal[style*="display:block"]') ||
-                        document.querySelector('.modal');
-            return modal ? modal.outerHTML : 'No modal found';
-        """)
-        logger.debug(f"    [DEBUG] Modal HTML: {modal_html}")
-
-        # Registrar estado inicial de cada checkbox en los logs
         logger.info("    [ESTADO INICIAL DE CHECKBOXES]:")
-        for item in cb_data:
-            if item["label"]:
-                estado_inicial = "MARCADO (✓)" if item["checked"] else "DESMARCADO (✗)"
-                logger.info(f"      • {item['label']}: {estado_inicial}")
+        for item in result["initial"]:
+            estado = "MARCADO (✓)" if item["checked"] else "DESMARCADO (✗)"
+            logger.info(f"      • {item['label']}: {estado}")
+
+        if result.get("unlabeled"):
+            logger.warning(f"    {result['unlabeled']} checkbox(es) sin etiqueta, omitidos")
 
         changes = []
-        for item in cb_data:
-            label_text = item["label"]
-            is_checked  = item["checked"]
-            idx         = item["index"]
+        for change in result["changes"]:
+            if change["ok"]:
+                action = "MARCADO   " if change["checked"] else "DESMARCADO"
+                mark = "✓" if change["checked"] else "✗"
+                logger.info(f"    [{action}] {change['label']}")
+                changes.append(f"{mark} {change['label']}")
+            else:
+                logger.warning(f"    [FALLÓ] No se pudo cambiar '{change['label']}'")
 
-            if not label_text:
-                logger.warning(f"    Checkbox #{idx} sin etiqueta, omitiendo")
-                continue
+        for label in result.get("unchanged", []):
+            logger.debug(f"    [SIN CAMBIOS] {label} (ya en el estado deseado)")
 
-            should_check = self._normalize(label_text) in target_normalized
+        # Guardar.
+        if not self.driver.execute_script(JS_CLICK_SAVE):
+            raise NoSuchElementException(
+                f"No se encontró el botón 'Guardar' en el modal de '{agent_name}'"
+            )
 
-            if should_check == is_checked:
-                logger.info(f"    [ACCION] {label_text} → Sin cambios (ya en estado deseado)")
-                continue
-
-            try:
-                cb_el = checkboxes_els[idx]
-                
-                # Hacer clic en el checkbox tal como lo haría un usuario
-                # (dispara todos los eventos del navegador de forma nativa)
-                self.driver.execute_script("arguments[0].scrollIntoView(true);", cb_el)
-                try:
-                    cb_el.click()
-                except Exception:
-                    self.driver.execute_script("arguments[0].click();", cb_el)
-
-                # Verificar si el estado cambió correctamente
-                now_checked = self.driver.execute_script("return arguments[0].checked;", cb_el)
-                
-                # Si no cambió, intentar clickear sobre la etiqueta label asociada
-                if now_checked != should_check:
-                    self.driver.execute_script("""
-                        var cb = arguments[0];
-                        var label = cb.labels ? cb.labels[0] : null;
-                        if (!label && cb.id) label = document.querySelector('label[for="' + cb.id + '"]');
-                        if (!label) label = cb.nextElementSibling;
-                        if (label) label.click();
-                        else cb.click();
-                    """, cb_el)
-
-                if should_check:
-                    changes.append(f"✓ {label_text}")
-                    logger.info(f"    [MARCADO]    {label_text}")
-                else:
-                    changes.append(f"✗ {label_text}")
-                    logger.info(f"    [DESMARCADO] {label_text}")
-                time.sleep(0.2)
-            except (IndexError, Exception) as err:
-                logger.warning(f"    No se pudo acceder al checkbox #{idx} ({label_text}): {err}")
-
-        # Guardar: obtener el botón e inspeccionar
-        save_btn = self._find_save_button_js()
-        btn_html = save_btn.get_attribute("outerHTML")
-        logger.info(f"    Guardando cambios. Botón HTML: {btn_html}")
-
-        # Ejecutar clic con Selenium nativo, ActionChains y JS de respaldo
-        try:
-            from selenium.webdriver.common.action_chains import ActionChains
-            ActionChains(self.driver).move_to_element(save_btn).click().perform()
-        except Exception as e:
-            logger.debug(f"    ActionChains click fallo, usando click directo: {e}")
-            try:
-                save_btn.click()
-            except Exception:
-                self.driver.execute_script("arguments[0].click();", save_btn)
-
-        # Esperar a que el modal se oculte (confirmación de guardado servidor)
+        # Esperar a que el modal se oculte (confirmación de guardado del servidor).
         try:
             self.wait.until(
-                EC.invisibility_of_element_located(
-                    (By.CSS_SELECTOR, ".modal.show, .modal[style*='display: block']")
-                )
+                EC.invisibility_of_element_located((By.CSS_SELECTOR, MODAL_VISIBLE_SELECTOR))
             )
-            logger.info("    Modal cerrado exitosamente tras guardar")
+            logger.debug("    Modal cerrado tras guardar")
         except TimeoutException:
-            logger.warning("    El modal no se cerró automáticamente tras 20s. Forzando espera...")
-            time.sleep(3)
+            logger.warning("    El modal no se cerró tras 20s; forzando cierre")
+            self._safe_close_modal()
 
         cambios_str = ", ".join(changes) if changes else "sin cambios"
         logger.info(f"  ✓ {agent_name} guardado — Cambios: {cambios_str}")
 
-
-    def _get_checkbox_label(self, checkbox, container) -> str | None:
-        """Intenta obtener el texto de la etiqueta asociada a un checkbox."""
-        # Estrategia 1: label con atributo for
-        cb_id = checkbox.get_attribute("id")
-        if cb_id:
-            try:
-                label = container.find_element(By.CSS_SELECTOR, f"label[for='{cb_id}']")
-                text = label.text.strip()
-                if text:
-                    return text
-            except NoSuchElementException:
-                pass
-
-        # Estrategia 2: label hermano inmediato
-        try:
-            label = checkbox.find_element(By.XPATH, "following-sibling::label[1]")
-            text = label.text.strip()
-            if text:
-                return text
-        except NoSuchElementException:
-            pass
-
-        # Estrategia 3: texto del elemento padre
-        try:
-            parent = checkbox.find_element(By.XPATH, "..")
-            text = parent.text.strip()
-            if text:
-                return text
-        except NoSuchElementException:
-            pass
-
-        return None
-
-    def _find_save_button_js(self):
-        """Busca el botón Guardar dentro del modal utilizando JavaScript."""
-        save_btn = self.driver.execute_script("""
-            var modal = document.querySelector('.modal.show') ||
-                        document.querySelector('.modal[style*="display: block"]') ||
-                        document.querySelector('.modal[style*="display:block"]');
-            if (!modal) return null;
-            var buttons = modal.querySelectorAll('button');
-            for (var i = 0; i < buttons.length; i++) {
-                if (buttons[i].textContent.trim().toLowerCase().includes('guardar')) {
-                    return buttons[i];
-                }
-            }
-            return modal.querySelector('button.btn-primary') || null;
-        """)
-        if not save_btn:
-            raise NoSuchElementException("No se encontró el botón 'Guardar' en el modal")
-        return save_btn
-
-    def _find_save_button(self, modal):
-        """Busca el botón Guardar dentro del modal."""
-        selectors = [
-            ".//button[normalize-space(text())='Guardar']",
-            ".//button[contains(text(),'Guardar')]",
-            ".//button[contains(@class,'btn-primary')]",
-        ]
-        for selector in selectors:
-            try:
-                btn = modal.find_element(By.XPATH, selector)
-                if btn.is_displayed():
-                    return btn
-            except NoSuchElementException:
-                continue
-        raise NoSuchElementException("No se encontró el botón 'Guardar' en el modal")
-
     def _safe_close_modal(self):
         """Intenta cerrar cualquier modal abierto de forma segura."""
         try:
-            close_btn = self.driver.find_element(
-                By.CSS_SELECTOR, ".modal.show .btn-close, .modal.show [data-dismiss='modal'], .modal.show .close"
-            )
-            close_btn.click()
-            time.sleep(0.5)
-        except Exception:
-            try:
-                cancel_btn = self.driver.find_element(
-                    By.XPATH, "//div[contains(@class,'modal')]//button[contains(text(),'Cancelar')]"
+            if self.driver.execute_script(JS_CLOSE_MODAL):
+                self.wait.until(
+                    EC.invisibility_of_element_located(
+                        (By.CSS_SELECTOR, MODAL_VISIBLE_SELECTOR)
+                    )
                 )
-                cancel_btn.click()
-                time.sleep(0.5)
-            except Exception:
-                pass
+        except Exception:
+            pass
